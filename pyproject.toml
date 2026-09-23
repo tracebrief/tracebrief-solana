@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracebrief-solana"
+version = "0.1.0"
+description = "Explain how funds left a Solana wallet and where they went - plain-language, verifiable incident reports."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "MB Kriptika", email = "info@tracebrief.io" }]
+keywords = ["solana", "forensics", "scam", "drainer", "fund-tracing", "security"]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+tbsol = "tbsol.cli:main"
+
+[project.urls]
+Homepage = "https://tracebrief.io"
+
+[tool.setuptools]
+packages = ["tbsol"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
