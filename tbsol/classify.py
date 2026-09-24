@@ -18,9 +18,10 @@ what the permission allows, not who is guilty.
 
 from __future__ import annotations
 
-from .model import U64_MAX, Finding, Transfer
+from .model import U64_MAX, Finding, Transfer, fmt_amount
 from .parse import (
     SYSTEM_PROGRAM,
+    account_keys,
     iter_instructions,
     outflows_from,
     parsed,
@@ -141,7 +142,7 @@ def classify(tx: dict, victim: str) -> tuple[list[Finding], list[Transfer]]:
                 code="DELEGATE_SPEND", severity="critical",
                 title="Tokens moved by a delegate, not by the owner",
                 detail=(
-                    f"{t.amount:g} of {_short(t.asset)} left the victim's account {_short(t.from_account)}. "
+                    f"{fmt_amount(t.amount)} of {_short(t.asset)} left the victim's account {_short(t.from_account)}. "
                     f"The move was authorised by {_short(t.authority)}, not by the owner - a permission granted "
                     "earlier was used."
                 ),
@@ -168,14 +169,37 @@ def classify(tx: dict, victim: str) -> tuple[list[Finding], list[Transfer]]:
     fee = (tx.get("meta") or {}).get("fee", 0) if victim == fee_payer(tx) else 0
     unexplained_sol = -sol_delta(tx, victim) - explicit_sol - fee
     if unexplained_sol > 1_000_000:  # > 0.001 SOL, ignore rent noise
+        # Balance changes are on-chain facts. If the accounts that gained SOL in this transaction
+        # together account for what the wallet lost, name them and make them traceable edges
+        # (drainers often split the take, e.g. 75/25 between two addresses).
+        gainers = sorted(
+            ((a, sol_delta(tx, a)) for a in account_keys(tx) if a != victim and sol_delta(tx, a) > 0),
+            key=lambda x: -x[1],
+        )
+        gained = sum(d for _, d in gainers)
+        receivers = [g for g in gainers if g[1] >= 0.01 * unexplained_sol] if 0.95 * unexplained_sol <= gained <= 1.05 * unexplained_sol else []
+        detail = (
+            f"{fmt_amount(unexplained_sol / 1e9)} SOL left the wallet without a plain transfer instruction - "
+            "a program moved it."
+        )
+        if receivers:
+            parts = ", ".join(f"{_short(a)} received {fmt_amount(d / 1e9)} SOL" for a, d in receivers)
+            detail += f" Balance changes in the same transaction show: {parts}."
+            for a, d in receivers:
+                outflows.append(Transfer(
+                    signature=sig, asset="SOL", amount_raw=d, decimals=9,
+                    from_owner=victim, to_owner=a, from_account=victim, to_account=a,
+                    kind="balance_delta", slot=tx.get("slot"), block_time=tx.get("blockTime"),
+                ))
+        else:
+            detail += " Check which program this transaction called."
+        receiver = receivers[0] if receivers else None
         findings.append(Finding(
             code="PROGRAM_OUTFLOW", severity="high",
             title="SOL left the wallet through a program",
-            detail=(
-                f"{unexplained_sol / 1e9:g} SOL left the wallet without a plain transfer instruction - "
-                "a program moved it. Check which program this transaction called."
-            ),
-            signature=sig, accounts={"wallet": victim},
+            detail=detail,
+            signature=sig, accounts={"wallet": victim, "receiver": receiver[0] if receiver else None,
+                                     "receivers": [a for a, _ in receivers]},
         ))
     explicit_tok: dict[str, int] = {}
     for t in outflows:

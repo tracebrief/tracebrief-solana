@@ -104,3 +104,17 @@ class IncidentReport:
             "hops": [h.to_dict() for h in self.hops],
             "notes": self.notes,
         }
+
+
+def fmt_amount(x: float) -> str:
+    """Human amount without scientific notation: 7,000,000 / 1,781.67 / 0.000123."""
+    if x == 0:
+        return "0"
+    a = abs(x)
+    if a >= 1000:
+        s = f"{x:,.2f}"
+    elif a >= 1:
+        s = f"{x:,.4f}"
+    else:
+        s = f"{x:.9f}"
+    return s.rstrip("0").rstrip(".") if "." in s else s

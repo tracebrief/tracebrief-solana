@@ -35,6 +35,10 @@ class TraceConfig:
     max_nodes: int = 40
     check_poisoning: bool = True
     history: int = 40
+    follow_up: bool = True  # look for later transactions that used a permission granted here
+    follow_accounts: int = 8
+    follow_txs: int = 10
+    collector_txs: int = 100  # keep scanning an address that only receives (a collector) up to this many txs
 
 
 def _ownership_edges(tx: dict, findings) -> list[Transfer]:
@@ -75,6 +79,55 @@ def _poisoning(rpc: SolanaRPC, report: IncidentReport, cfg: TraceConfig):
     return find_poisoning(report.signature, recipients, prev, dust)
 
 
+FOLLOW_USE_CODES = {"DELEGATE_SPEND", "PROGRAM_OUTFLOW", "OWNER_REASSIGNED"}
+
+
+def _follow_up(rpc: SolanaRPC, report: IncidentReport, cfg: TraceConfig) -> int:
+    """A permission (delegate approval, wallet assigned to a program) moves nothing in the
+    transaction that grants it - the loss comes later, often in transactions that do not
+    even list the victim's wallet. Look at the affected accounts after this slot and pull
+    in the transactions that used the permission. Returns how many were found."""
+    targets: list[str] = []
+    for f in report.findings:
+        acc = None
+        if f.code == "DELEGATE_APPROVED":
+            acc = f.accounts.get("token_account")
+        elif f.code == "WALLET_ASSIGNED":
+            acc = f.accounts.get("wallet") or report.victim
+        if acc and acc not in targets:
+            targets.append(acc)
+    targets = targets[: cfg.follow_accounts]
+    if not targets:
+        return 0
+    seen = {report.signature}
+    used = 0
+    for acc in targets:
+        sigs, _busy = rpc.signatures_after(acc, after_slot=(report.slot or 0) - 1, max_items=cfg.follow_txs)
+        for s in sigs:
+            sg = s["signature"]
+            if sg in seen:
+                continue
+            seen.add(sg)
+            tx = rpc.get_transaction(sg)
+            if not tx:
+                continue
+            f2, out2 = classify(tx, report.victim)
+            misuse = [f for f in f2 if f.code in FOLLOW_USE_CODES]
+            if not misuse:
+                continue
+            used += 1
+            have_unsigned = any(f.code == "NOT_SIGNED_BY_VICTIM" for f in report.findings)
+            report.findings += [f for f in f2 if f.code in FOLLOW_USE_CODES
+                                or (f.code == "NOT_SIGNED_BY_VICTIM" and not have_unsigned)]
+            report.outflows += out2
+    report.notes.append(
+        f"Later use of the permission: checked {len(targets)} affected account(s) after this transaction; "
+        f"{used} later transaction(s) moved value using it."
+        + (" They are included below with their own signatures." if used else "")
+    )
+    return used
+
+
 def explain(
     signature: str,
     victim: Optional[str] = None,
@@ -103,8 +156,13 @@ def explain(
             report.findings += _poisoning(rpc, report, cfg)
         except Exception as e:  # history lookups are best-effort
             report.notes.append(f"Address-poisoning check skipped: {e}")
+    if cfg.follow_up and not report.outflows:
+        try:
+            _follow_up(rpc, report, cfg)
+        except Exception as e:  # best-effort, like the poisoning check
+            report.notes.append(f"Later-use check skipped: {e}")
     report.findings = sort_findings(report.findings)
-    report.hops = trace_forward(rpc, report.outflows, labels, cfg, report.notes)
+    report.hops = trace_forward(rpc, report.outflows, labels, cfg, report.notes, victim=report.victim)
     return report
 
 
@@ -124,7 +182,8 @@ def _endpoint(rpc: SolanaRPC, labels: LabelStore, t: Transfer) -> tuple[Optional
     return None, None
 
 
-def trace_forward(rpc: SolanaRPC, start: list[Transfer], labels: LabelStore, cfg: TraceConfig, notes: list[str]) -> list[Hop]:
+def trace_forward(rpc: SolanaRPC, start: list[Transfer], labels: LabelStore, cfg: TraceConfig, notes: list[str],
+                  victim: Optional[str] = None) -> list[Hop]:
     hops: list[Hop] = []
     queue: list[tuple[Transfer, int]] = [(t, 1) for t in sorted(start, key=lambda t: -t.amount_raw)[: cfg.fanout]]
     seen: set[tuple[str, str]] = set()
@@ -138,6 +197,10 @@ def trace_forward(rpc: SolanaRPC, start: list[Transfer], labels: LabelStore, cfg
         seen.add(key)
         hop = Hop(depth=depth, transfer=t)
         hops.append(hop)
+        if victim and node == victim:
+            # e.g. the attacker tops up the victim's SOL to pay fees for the next drain
+            hop.endpoint, hop.endpoint_type = "Back to the victim's own wallet - not followed further", "RETURN"
+            continue
         ep, ep_type = _endpoint(rpc, labels, t)
         if ep:
             hop.endpoint, hop.endpoint_type = ep, ep_type
@@ -150,15 +213,28 @@ def trace_forward(rpc: SolanaRPC, start: list[Transfer], labels: LabelStore, cfg
             notes.append("Trace stopped early: node budget exhausted.")
             continue
         visited += 1
-        sigs, busy = rpc.signatures_after(node, after_slot=t.slot or 0, max_items=cfg.per_node_txs)
+        sigs, busy = rpc.signatures_after(node, after_slot=t.slot or 0, max_items=max(cfg.per_node_txs, cfg.collector_txs))
         if busy:
             hop.endpoint, hop.endpoint_type = "High-activity address - typical of an exchange or service wallet (unlabelled)", "SERVICE"
             continue
         nxt: list[Transfer] = []
+        scanned = 0
         for s in sigs:
+            # A collector wallet first receives from many victims and only then moves the money on:
+            # keep reading past the first page until something leaves, up to collector_txs.
+            onward = [x for x in nxt if x.to_owner != victim]  # a fee top-up back to the victim is not "onward"
+            if scanned >= cfg.per_node_txs and (onward or scanned >= cfg.collector_txs):
+                break
+            scanned += 1
             tx = rpc.get_transaction(s["signature"])
             if tx:
                 nxt += outflows_from(tx, node, s["signature"])
+        if scanned > cfg.per_node_txs:
+            notes.append(
+                f"{node[:4]}…{node[-4:]} mostly receives from other wallets (a collector); read {scanned} of its transactions "
+                "to find where the money went next. From here on the money is pooled with other senders' funds: the next hops "
+                "show where the pool went, not only this wallet's share."
+            )
         if not nxt:
             hop.endpoint, hop.endpoint_type = "No outgoing movement since - funds appear to sit here", "DORMANT"
             continue

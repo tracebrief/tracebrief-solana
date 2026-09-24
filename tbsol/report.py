@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 
 from .labels import asset_name
-from .model import IncidentReport
+from .model import IncidentReport, fmt_amount
 
 EXPLORER = "https://solscan.io/tx/"
 SEV_MARK = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "info": "INFO"}
@@ -48,9 +48,10 @@ def to_markdown(report: IncidentReport) -> str:
         L.append("|---|---|---|---|---|---|")
         for h in report.hops:
             t = h.transfer
-            kind = " (ownership change)" if t.kind == "ownership_change" else (" (account rent)" if t.kind == "close_account_rent" else "")
+            kind = {"ownership_change": " (ownership change)", "close_account_rent": " (account rent)",
+                    "balance_delta": " (moved by a program)"}.get(t.kind, "")
             L.append(
-                f"| {h.depth} | {_s(t.from_owner)} | {_s(t.to_owner)} | {t.amount:,.6g} {asset_name(t.asset)}{kind} | "
+                f"| {h.depth} | {_s(t.from_owner)} | {_s(t.to_owner)} | {fmt_amount(t.amount)} {asset_name(t.asset)}{kind} | "
                 f"[{t.signature[:8]}…]({EXPLORER}{t.signature}) | {h.endpoint or '-'} |"
             )
         L.append("")
