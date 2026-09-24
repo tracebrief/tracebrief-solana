@@ -37,7 +37,7 @@ The unit tests prove each detector works on hand-built and captured transactions
 
 ## What the cases changed in the engine
 
-Each fix has a regression test built on the real case, and the suite has 28 tests.
+Each fix has a regression test built on the real case, and the suite has 31 tests.
 
 1. **Look-alike rule** (`poisoning.py`): now 4 matching characters at the start **or** the end, instead of both. The real case matched only the start. A random address shares four given base58 characters with probability 1/58⁴, about 1 in 11 million.
 2. **Later use of a permission** (`trace.py`, `_follow_up`): when a transaction grants a delegate or reassigns the wallet but moves nothing, `tbsol` reads the affected accounts afterwards and pulls in the transactions that used the permission. Without this, a victim who brings the transaction they signed gets "no outgoing value". That is the most common thing a victim remembers.
@@ -45,6 +45,10 @@ Each fix has a regression test built on the real case, and the suite has 28 test
 4. **Collectors** (`trace.py`): an address that first receives from many wallets is read further (up to 100 transactions) until something leaves. The report says that funds are pooled from that point on.
 5. **Victim's own wallet**: a top-up back to the victim ends that branch instead of being followed as the attacker's trail.
 6. **Amounts** are never printed in scientific notation (`7e+06` became `7,000,000`).
+7. **"Funds appear to still be here" is checked against the balance now.** The released engine inferred it from the transactions it happened to read, and in case #12 that was false. The claim is now made only when the current balance still covers the amount. Otherwise the hop says "moved on, but not within the transactions read" (`UNRESOLVED`).
+8. **"Service-like" is judged by pace.** An address is called exchange- or service-like only if its latest 1,000 transactions fall within 7 days. Slower addresses are reported as `ACTIVE` and left out of "Who to contact".
+
+**Final re-run (2026-09-24, all 15 transactions, final engine, 31 tests):** every mechanism is still found (15/15), and every fund trail is found (9/9). No hop claims that funds are sitting still unless the live balance confirms it. The follow-up of later permission use also found the drains for three of the five sampled hijacked wallets starting from their setup transaction alone.
 
 ## What is still missing
 
