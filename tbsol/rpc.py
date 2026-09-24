@@ -87,6 +87,20 @@ class SolanaRPC:
         self._cache[key] = owner
         return owner
 
+    def get_balance(self, address: str) -> int:
+        """Current lamports of ``address``."""
+        res = self.call("getBalance", [address, {"commitment": "confirmed"}])
+        return int((res or {}).get("value", 0))
+
+    def get_token_balance(self, owner: str, mint: str) -> int:
+        """Current raw balance of ``mint`` summed over all token accounts owned by ``owner``."""
+        res = self.call("getTokenAccountsByOwner", [owner, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+        total = 0
+        for acc in (res or {}).get("value", []) or []:
+            info = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+            total += int((info.get("tokenAmount") or {}).get("amount", 0))
+        return total
+
     def signatures_after(self, address: str, after_slot: int, max_items: int = 50, page: int = 100, max_pages: int = 10) -> tuple[list[dict], bool]:
         """Successful signatures involving ``address`` with slot > ``after_slot``.
 
@@ -97,6 +111,7 @@ class SolanaRPC:
         """
         out: list[dict] = []
         before = None
+        self.last_window = None  # (newest blockTime, oldest blockTime read) when busy - lets callers judge the rate
         for _ in range(max_pages):
             batch = self.get_signatures(address, limit=page, before=before)
             if not batch:
@@ -109,4 +124,6 @@ class SolanaRPC:
             if len(batch) < page:
                 return list(reversed(out))[:max_items], False
             before = batch[-1]["signature"]
+        if out:
+            self.last_window = (out[0].get("blockTime"), out[-1].get("blockTime"))
         return list(reversed(out))[:max_items], True

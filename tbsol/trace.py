@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .classify import classify, sort_findings
-from .labels import LabelStore
-from .model import Hop, IncidentReport, Transfer
+from .labels import LabelStore, asset_name
+from .model import Hop, IncidentReport, Transfer, fmt_amount
 from .parse import SYSTEM_PROGRAM, extract_transfers, fee_payer, outflows_from, token_accounts
 from .poisoning import find_poisoning
 from .rpc import SolanaRPC
@@ -182,6 +182,45 @@ def _endpoint(rpc: SolanaRPC, labels: LabelStore, t: Transfer) -> tuple[Optional
     return None, None
 
 
+SERVICE_MAX_DAYS = 7  # 1,000+ transactions within a week: exchange-like; slower than that could be an active user
+
+
+def _busy_endpoint(window) -> tuple[str, str]:
+    """Too much activity to follow. Only call it service-like when the pace says so."""
+    days = None
+    if window and all(window):
+        days = max((window[0] - window[1]) / 86400, 0)
+    if days is None or days <= SERVICE_MAX_DAYS:
+        pace = f" (its latest 1,000 transactions span {fmt_amount(round(days, 1))} days)" if days is not None else ""
+        return f"High-activity address{pace} - typical of an exchange or service wallet (unlabelled)", "SERVICE"
+    return (
+        f"Active address (1,000+ transactions since then; the latest 1,000 span {fmt_amount(round(days))} days) - not followed; "
+        "it may be a service or simply an active wallet",
+        "ACTIVE",
+    )
+
+
+def _holding_endpoint(rpc: SolanaRPC, node: str, t: Transfer, scanned: int, available: int) -> tuple[str, str]:
+    try:
+        if t.asset == "SOL":
+            now = rpc.get_balance(node)
+        else:
+            now = rpc.get_token_balance(node, t.asset)
+    except Exception:
+        now = None
+    read = f"no outgoing movement in the {scanned} transaction(s) read since"
+    if now is None:
+        return f"Not confirmed: {read}, and the current balance could not be checked", "UNRESOLVED"
+    have = fmt_amount(now / (10**t.decimals) if t.decimals else now)
+    unit = "SOL" if t.asset == "SOL" else asset_name(t.asset)
+    if now >= 0.9 * t.amount_raw:
+        return f"Funds appear to still be here: {read}, and the balance now is {have} {unit}", "DORMANT"
+    return (
+        f"Moved on, but not within the transactions read ({read}; balance now {have} {unit}) - not followed further",
+        "UNRESOLVED",
+    )
+
+
 def trace_forward(rpc: SolanaRPC, start: list[Transfer], labels: LabelStore, cfg: TraceConfig, notes: list[str],
                   victim: Optional[str] = None) -> list[Hop]:
     hops: list[Hop] = []
@@ -215,7 +254,7 @@ def trace_forward(rpc: SolanaRPC, start: list[Transfer], labels: LabelStore, cfg
         visited += 1
         sigs, busy = rpc.signatures_after(node, after_slot=t.slot or 0, max_items=max(cfg.per_node_txs, cfg.collector_txs))
         if busy:
-            hop.endpoint, hop.endpoint_type = "High-activity address - typical of an exchange or service wallet (unlabelled)", "SERVICE"
+            hop.endpoint, hop.endpoint_type = _busy_endpoint(getattr(rpc, "last_window", None))
             continue
         nxt: list[Transfer] = []
         scanned = 0
@@ -235,9 +274,13 @@ def trace_forward(rpc: SolanaRPC, start: list[Transfer], labels: LabelStore, cfg
                 "to find where the money went next. From here on the money is pooled with other senders' funds: the next hops "
                 "show where the pool went, not only this wallet's share."
             )
-        if not nxt:
-            hop.endpoint, hop.endpoint_type = "No outgoing movement since - funds appear to sit here", "DORMANT"
-            continue
+        onward = [x for x in nxt if x.to_owner != victim]
+        if not onward:
+            # "The funds sit here" is a strong claim in a report - check it against the balance right now
+            # instead of inferring it from the transactions we happened to read.
+            hop.endpoint, hop.endpoint_type = _holding_endpoint(rpc, node, t, scanned, len(sigs))
+            if not nxt:
+                continue
         same = sorted([x for x in nxt if x.asset == t.asset], key=lambda x: -x.amount_raw)
         other = [x for x in nxt if x.asset != t.asset]
         for x in (same + other)[: cfg.fanout]:

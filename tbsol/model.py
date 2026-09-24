@@ -72,7 +72,7 @@ class Hop:
     depth: int
     transfer: Transfer
     endpoint: Optional[str] = None  # label or reason the trail stops here
-    endpoint_type: Optional[str] = None  # EXCHANGE | BRIDGE | DEX | PROGRAM | DORMANT | LIMIT | MIXER | SANCTIONED
+    endpoint_type: Optional[str] = None  # EXCHANGE | BRIDGE | DEX | PROGRAM | DORMANT | UNRESOLVED | RETURN | SERVICE | ACTIVE | LIMIT | MIXER | SANCTIONED
 
     def to_dict(self) -> dict:
         d = {"depth": self.depth, "endpoint": self.endpoint, "endpoint_type": self.endpoint_type}

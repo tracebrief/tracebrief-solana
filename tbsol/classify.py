@@ -61,7 +61,7 @@ def classify(tx: dict, victim: str) -> tuple[list[Finding], list[Transfer]]:
                 title="Pre-signed transaction (durable nonce)",
                 detail=(
                     "This transaction uses a durable nonce, so it does not expire. It could have been "
-                    "signed days or weeks before it was executed - which explains a theft that happened "
+                    "signed days or weeks before it was executed - which can explain a theft that happened "
                     "while the owner was not signing anything."
                 ),
                 signature=sig, accounts={"nonce_account": info.get("nonceAccount"), "nonce_authority": info.get("nonceAuthority")},
