@@ -15,8 +15,19 @@ SYSTEM = "11111111111111111111111111111111"
 
 
 class FakeRPC:
-    def __init__(self, txs, history, owners=None):
+    def __init__(self, txs, history, owners=None, balances=None):
         self.txs, self.history, self.owners = txs, history, owners or {}
+        self.balances = balances  # {(address, asset): raw}; None = balances unknown
+
+    def get_balance(self, address):
+        if self.balances is None:
+            raise RuntimeError("no balances in this fake")
+        return self.balances.get((address, "SOL"), 0)
+
+    def get_token_balance(self, owner, mint):
+        if self.balances is None:
+            raise RuntimeError("no balances in this fake")
+        return self.balances.get((owner, mint), 0)
 
     def get_transaction(self, sig):
         return self.txs.get(sig)
@@ -56,9 +67,10 @@ def test_trace_stops_at_dormant_and_program_accounts():
         txs={"inc": sol(V, MULE, 1_000_000_000, "inc")},
         history={},
         owners={MULE: SYSTEM},
+        balances={(MULE, "SOL"): 1_000_000_000},
     )
     rep = explain("inc", V, rpc=rpc, cfg=TraceConfig(check_poisoning=False))
-    assert rep.hops[0].endpoint_type == "DORMANT"
+    assert rep.hops[0].endpoint_type == "DORMANT" and "balance now is 1 SOL" in rep.hops[0].endpoint
 
     rpc2 = FakeRPC(txs={"inc": sol(V, vault, 1_000_000_000, "inc")}, history={}, owners={vault: "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"})
     rep2 = explain("inc", V, rpc=rpc2, cfg=TraceConfig(check_poisoning=False))
@@ -204,3 +216,34 @@ def test_program_moved_sol_split_between_two_receivers():
     f = next(f for f in findings if f.code == "PROGRAM_OUTFLOW")
     assert set(f.accounts["receivers"]) == {R1, R2}
     assert {o.to_owner for o in outflows} == {R1, R2}
+
+
+def test_never_claims_funds_sit_still_when_the_balance_says_otherwise():
+    """Mainnet, Dec 2024 (web3.js key theft): the released engine read the collector's first
+    transactions, saw no outflow and wrote "funds appear to sit here" - but the balance was
+    already gone. The claim must be checked against the balance now."""
+    rpc = FakeRPC(txs={"inc": sol(V, MULE, 1_000_000_000, "inc")}, history={}, balances={(MULE, "SOL"): 5_000})
+    rep = explain("inc", V, rpc=rpc, cfg=TraceConfig(check_poisoning=False))
+    assert rep.hops[0].endpoint_type == "UNRESOLVED" and "Moved on" in rep.hops[0].endpoint
+    rpc2 = FakeRPC(txs={"inc": sol(V, MULE, 1_000_000_000, "inc")}, history={})  # balance unknown
+    rep2 = explain("inc", V, rpc=rpc2, cfg=TraceConfig(check_poisoning=False))
+    assert rep2.hops[0].endpoint_type == "UNRESOLVED" and "Not confirmed" in rep2.hops[0].endpoint
+
+
+def test_only_a_top_up_back_to_victim_is_not_onward():
+    """If the only thing that left the mule is a fee top-up to the victim, the main funds are
+    still unaccounted for - say so instead of silently dropping them."""
+    txs = {"inc": sol(V, MULE, 5_000_000_000, "inc"), "fee": sol(MULE, V, 50_000_000, "fee", 101)}
+    rpc = FakeRPC(txs, {MULE: ["fee"]}, balances={(MULE, "SOL"): 10_000})
+    rep = explain("inc", V, rpc=rpc, cfg=TraceConfig(check_poisoning=False, max_hops=3))
+    first = rep.hops[0]
+    assert first.endpoint_type == "UNRESOLVED"
+    assert any(h.transfer.signature == "fee" and h.endpoint_type == "RETURN" for h in rep.hops)
+
+
+def test_busy_address_is_service_only_when_the_pace_says_so():
+    from tbsol.trace import _busy_endpoint
+    day = 86400
+    assert _busy_endpoint((10 * day, 9 * day))[1] == "SERVICE"          # 1,000 txs in one day
+    assert _busy_endpoint((400 * day, 10 * day))[1] == "ACTIVE"         # 1,000 txs over 390 days
+    assert _busy_endpoint(None)[1] == "SERVICE"                          # unknown pace: keep the hedged wording
