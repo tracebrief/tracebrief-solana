@@ -110,3 +110,97 @@ def test_json_output_roundtrip():
     import json
     d = json.loads(to_json(explain("inc", V, rpc=rpc, cfg=TraceConfig(check_poisoning=False))))
     assert d["signature"] == "inc" and d["hops"][0]["to_owner"] == MULE
+
+
+def test_poisoning_prefix_only_real_case():
+    """Mainnet, 2024-11-23: 7,000,000 PYTH sent to a look-alike that matched only the
+    first four characters of the address the wallet had paid 13 times before. The
+    look-alike had sent the wallet 0.000001 SOL two days earlier."""
+    genuine = "4yfu48qwim7hGzD3Nphzd2A6ThydzysfKi4wBPFSgnhY"
+    fake = "4yfuQCL4fnNfSbBgqFcPTFn5GGZABDaEFQLhGpwjizcY"
+    assert lookalike(fake, genuine)
+    f = find_poisoning("T3vqZjMEi8MrJ34p", [fake], [genuine], dust_senders=[fake])
+    assert f and f[0].severity == "critical"
+    assert "first four characters" in f[0].detail
+
+
+def test_lookalike_is_specific():
+    assert not lookalike("4yfuQCL4fnNfSbBgqFcPTFn5GGZABDaEFQLhGpwjizcY", "9w2e3kpt5XUQXLdGb51nRWZoh4JFs6FL7TdEYsvKq6Wb")
+
+
+def test_amounts_never_scientific():
+    from tbsol.model import fmt_amount
+    assert fmt_amount(7_000_000) == "7,000,000"
+    assert fmt_amount(37_500_000.5) == "37,500,000.5"
+    assert fmt_amount(1781.67) == "1,781.67"
+    assert fmt_amount(0.000123) == "0.000123"
+    assert "e" not in fmt_amount(1e-8) and "e" not in fmt_amount(3.75e7)
+
+
+def test_follow_up_finds_later_delegate_spend():
+    """Real pattern (mainnet, Nov 2025, ~$3M): the approval moves nothing; the drain is a
+    later transaction that does not list the victim's wallet at all. The report for the
+    approval must still find it and trace it."""
+    from conftest import ix, make_tx, tb
+    from tbsol.model import U64_MAX
+    V_ATA, ATT, A_ATA, USDC = "VictimUsdcAta111111111111111111111111111111", "Attacker1111111111111111111111111111111111", \
+        "AttackerUsdcAta1111111111111111111111111111", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    approve = make_tx([ix("spl-token", "approve", source=V_ATA, delegate=ATT, owner=V, amount=str(U64_MAX))],
+                      signers=(V,), keys=[V, V_ATA], sig="approve")
+    drain = make_tx(
+        [ix("spl-token", "transferChecked", source=V_ATA, destination=A_ATA, authority=ATT, mint=USDC,
+            tokenAmount={"amount": "2500000000", "decimals": 6})],
+        signers=(ATT,), keys=[ATT, V_ATA, A_ATA], sig="drain",
+        pre_tokens=[tb(1, USDC, V, 2_500_000_000), tb(2, USDC, ATT, 0)],
+        post_tokens=[tb(1, USDC, V, 0), tb(2, USDC, ATT, 2_500_000_000)],
+    )
+    drain["slot"] = 101
+    rep = explain("approve", V, rpc=FakeRPC({"approve": approve, "drain": drain}, {V_ATA: ["drain"]}),
+                  cfg=TraceConfig(check_poisoning=False, max_hops=1))
+    codes = {f.code for f in rep.findings}
+    assert {"DELEGATE_APPROVED", "DELEGATE_SPEND"} <= codes
+    assert rep.hops and rep.hops[0].transfer.to_owner == ATT and rep.hops[0].transfer.signature == "drain"
+    assert any("Later use of the permission" in n and "1 later transaction" in n for n in rep.notes)
+
+
+def test_program_moved_sol_names_the_receiver():
+    from conftest import ix, make_tx
+    DRAINER, SINK = "Dra1nerProgram1111111111111111111111111111", "Sink111111111111111111111111111111111111111"
+    t = make_tx([{"programId": DRAINER, "accounts": [V, SINK], "data": "x", "stackHeight": 1}],
+                signers=(SINK,), keys=[SINK, V], pre=[1_000_000, 1_773_680_000], post=[1_773_675_000, 1_000_000], sig="pm")
+    from tbsol.classify import classify
+    findings, outflows = classify(t, V)
+    f = next(f for f in findings if f.code == "PROGRAM_OUTFLOW")
+    assert "received" in f.detail and f.accounts["receiver"] == SINK
+    assert outflows and outflows[0].to_owner == SINK and outflows[0].kind == "balance_delta"
+
+
+def test_trace_does_not_follow_back_into_victim_and_reads_past_collector_inflows():
+    OTHER = "OtherVictim11111111111111111111111111111111"
+    txs = {"inc": sol(V, MULE, 5_000_000_000, "inc")}
+    hist = []
+    for i in range(30):  # the collector first receives from other victims ...
+        s = f"in{i}"; txs[s] = sol(OTHER, MULE, 1_000_000_000, s, 101 + i); hist.append(s)
+    txs["fee"] = sol(MULE, V, 50_000_000, "fee", 140); hist.append("fee")   # ... tops the victim up for fees ...
+    txs["out"] = sol(MULE, EXCH, 30_000_000_000, "out", 141); hist.append("out")  # ... then consolidates
+    rpc = FakeRPC(txs, {MULE: hist})
+    labels = LabelStore({EXCH: Label(EXCH, "Example Exchange hot wallet", "EXCHANGE", "https://example.com/por")})
+    rep = explain("inc", V, rpc=rpc, labels=labels, cfg=TraceConfig(check_poisoning=False, max_hops=3))
+    back = [h for h in rep.hops if h.transfer.to_owner == V]
+    assert back and back[0].endpoint_type == "RETURN"
+    assert any(h.endpoint_type == "EXCHANGE" and h.transfer.signature == "out" for h in rep.hops)
+    assert any("collector" in n for n in rep.notes)
+
+
+def test_program_moved_sol_split_between_two_receivers():
+    """Mainnet pattern (Nov 2025): the drainer program split 1.772676109 SOL 75/25."""
+    from conftest import make_tx
+    from tbsol.classify import classify
+    OP, R1, R2 = "Operator11111111111111111111111111111111111", "Receiver75111111111111111111111111111111111", "Receiver25111111111111111111111111111111111"
+    t = make_tx([{"programId": "Dra1nerProgram1111111111111111111111111111", "accounts": [V], "data": "x", "stackHeight": 1}],
+                signers=(OP,), keys=[OP, V, R1, R2], fee=205000,
+                pre=[10_000_000, 1_773_676_109, 0, 0], post=[9_795_000, 1_000_000, 1_329_507_082, 443_169_027])
+    findings, outflows = classify(t, V)
+    f = next(f for f in findings if f.code == "PROGRAM_OUTFLOW")
+    assert set(f.accounts["receivers"]) == {R1, R2}
+    assert {o.to_owner for o in outflows} == {R1, R2}
