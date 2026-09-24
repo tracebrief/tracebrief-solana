@@ -85,12 +85,15 @@ TraceBrief's production label set (exchange proof-of-reserves wallets, OFAC list
 pip install pytest && python -m pytest -q
 ```
 
+**Validation on real incidents:** [VALIDATION.md](VALIDATION.md) runs the engine on 15 mainnet transactions from publicly investigated thefts (owner-change drainer, address poisoning, durable-nonce takeover, stolen keys). It lists where the engine was wrong and what changed.
+
 The suite combines **real mainnet transactions** captured with `getTransaction` (unlimited `approveChecked`, `approve` + `burn`, durable nonce, `closeAccount`, `assign`, SOL and USDC transfers, Token-2022 `transferCheckedWithFee`) with **synthetic attack scenarios** (ownership change without any transfer, delegate spend without the victim's signature, wallet reassignment, SOL moved by a program, address poisoning) and an offline fake RPC for the tracer.
 
 ## Limits
 
 - The public RPC is rate-limited; use `--rpc` with your own endpoint for real cases.
 - Swaps are followed as outflows of any asset from the wallet; the report does not yet price assets in USD.
+- After a collector address (one that receives from many wallets), funds are pooled: later hops show where the pool went, not one victim's share. The report says so.
 - Bridges end the Solana trail; TraceBrief continues on the destination chain only when the bridge confirms the destination transaction.
 - A finding explains a mechanism. It is not legal advice and it does not recover funds.
 
